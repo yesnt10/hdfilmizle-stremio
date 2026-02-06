@@ -34,6 +34,21 @@ function slugify(value) {
     .replace(/^-+|-+$/g, '');
 }
 
+function encodeB64Url(input) {
+  return Buffer.from(String(input), 'utf8')
+    .toString('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+function decodeB64Url(input) {
+  const normalized = String(input || '').replace(/-/g, '+').replace(/_/g, '/');
+  const pad = normalized.length % 4;
+  const padded = pad ? normalized + '='.repeat(4 - pad) : normalized;
+  return Buffer.from(padded, 'base64').toString('utf8');
+}
+
 function withTimeout(promise, timeoutMs, timeoutMessage = 'İstek zaman aşımına uğradı') {
   let timeout;
   const timeoutPromise = new Promise((_, reject) => {
@@ -97,9 +112,9 @@ function getJsonLd($) {
 }
 
 function pickImage(item, $card = null, $ = null) {
+  if (Array.isArray(item?.image) && item.image[0]) return normalizeUrl(item.image[0]);
   if (item?.image) return normalizeUrl(item.image);
   if (item?.thumbnailUrl) return normalizeUrl(item.thumbnailUrl);
-  if (Array.isArray(item?.image) && item.image[0]) return normalizeUrl(item.image[0]);
   if ($ && $card) {
     const src =
       attrOrNull($, 'img', 'data-src', $card) ||
@@ -111,14 +126,24 @@ function pickImage(item, $card = null, $ = null) {
 }
 
 function buildMetaId(type, sourceUrl, title) {
-  const hash = Buffer.from(sourceUrl || title || `${Date.now()}`)
-    .toString('base64')
-    .replace(/=/g, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .slice(0, 24);
+  const encodedSource = encodeB64Url(sourceUrl);
+  return `hdfilmizle:${type}:${slugify(title) || 'icerik'}:${encodedSource}`;
+}
 
-  return `hdfilmizle:${type}:${slugify(title) || 'icerik'}:${hash}`;
+function parseMetaId(metaId) {
+  const parts = String(metaId || '').split(':');
+  if (parts.length < 4 || parts[0] !== 'hdfilmizle') return null;
+
+  const type = parts[1];
+  const encodedSource = parts.slice(3).join(':');
+
+  try {
+    const sourceUrl = decodeB64Url(encodedSource);
+    if (!/^https?:\/\//i.test(sourceUrl)) return null;
+    return { type, sourceUrl };
+  } catch {
+    return null;
+  }
 }
 
 function detectContentType(input = '') {
@@ -128,8 +153,10 @@ function detectContentType(input = '') {
   return 'movie';
 }
 
-function catalogUrlForType(type) {
-  return type === 'series' ? `${BASE_URL}/dizi` : BASE_URL;
+function catalogUrlForType(type, search = '') {
+  const base = type === 'series' ? `${BASE_URL}/dizi` : BASE_URL;
+  if (!search) return base;
+  return `${BASE_URL}/?s=${encodeURIComponent(search)}`;
 }
 
 function extractCardsFromPage(html, fallbackType = 'movie') {
@@ -171,8 +198,8 @@ function extractCardsFromPage(html, fallbackType = 'movie') {
       genres: Array.isArray(item.genre)
         ? item.genre.map((g) => String(g).trim()).filter(Boolean)
         : typeof item.genre === 'string'
-        ? [item.genre.trim()].filter(Boolean)
-        : [],
+          ? [item.genre.trim()].filter(Boolean)
+          : [],
     });
   });
 
@@ -201,8 +228,8 @@ function extractCardsFromPage(html, fallbackType = 'movie') {
       textOrNull($, '.title', $el) ||
       textOrNull($, 'h2', $el) ||
       textOrNull($, 'h3', $el) ||
-      textOrNull($, 'a[title]', $el) ||
-      attrOrNull($, 'a[title]', 'title', $el);
+      attrOrNull($, 'a[title]', 'title', $el) ||
+      textOrNull($, 'a', $el);
 
     if (!name) return;
 
@@ -239,10 +266,7 @@ function extractVideoLinks(html) {
     const cleanUrl = normalizeUrl(url);
     if (!cleanUrl || seen.has(cleanUrl)) return;
     seen.add(cleanUrl);
-    links.push({
-      title,
-      url: cleanUrl,
-    });
+    links.push({ title, url: cleanUrl });
   };
 
   $('iframe').each((_, el) => {
@@ -261,7 +285,7 @@ function extractVideoLinks(html) {
     const text = $(el).text().replace(/\s+/g, ' ').trim();
     if (!href) return;
 
-    const looksLikeVideo = /m3u8|mp4|stream|player|izle|watch/i.test(href);
+    const looksLikeVideo = /m3u8|mp4|stream|player|izle|watch|embed/i.test(href);
     if (looksLikeVideo) pushLink(href, text || 'Bağlantı');
   });
 
@@ -274,6 +298,51 @@ function extractVideoLinks(html) {
   urlMatches.forEach((url) => pushLink(url, 'Script Kaynağı'));
 
   return links;
+}
+
+function parseMetaFromDetailHtml(type, sourceUrl, html) {
+  const $ = load(html);
+  const jsonLd = getJsonLd($);
+  const preferredLd = jsonLd.find((x) => x.name && (x.description || x.aggregateRating)) || null;
+
+  const name =
+    preferredLd?.name ||
+    textOrNull($, 'h1') ||
+    textOrNull($, '.title') ||
+    textOrNull($, 'title') ||
+    'İçerik';
+
+  const year =
+    parseYearFromText(preferredLd?.datePublished) ||
+    parseYearFromText(textOrNull($, '.year')) ||
+    parseYearFromText($.text()) ||
+    null;
+
+  const description =
+    preferredLd?.description ||
+    textOrNull($, '.summary') ||
+    textOrNull($, '.description') ||
+    'Açıklama bulunamadı.';
+
+  return {
+    id: buildMetaId(type, sourceUrl, name),
+    type,
+    sourceUrl,
+    name,
+    poster: pickImage(preferredLd) || normalizeUrl(attrOrNull($, 'meta[property="og:image"]', 'content')),
+    background:
+      pickImage(preferredLd) || normalizeUrl(attrOrNull($, 'meta[property="og:image"]', 'content')),
+    description,
+    releaseInfo: year ? String(year) : null,
+    imdbRating: preferredLd?.aggregateRating?.ratingValue
+      ? String(preferredLd.aggregateRating.ratingValue)
+      : null,
+    genres: Array.isArray(preferredLd?.genre)
+      ? preferredLd.genre.map((g) => String(g).trim()).filter(Boolean)
+      : typeof preferredLd?.genre === 'string'
+        ? [preferredLd.genre.trim()].filter(Boolean)
+        : [],
+  };
 }
 
 function toStremioMeta(card) {
@@ -295,7 +364,7 @@ function toStremioMeta(card) {
 }
 
 async function getCatalog(type, search = '') {
-  const html = await fetchHtml(catalogUrlForType(type));
+  const html = await fetchHtml(catalogUrlForType(type, search));
   const cards = extractCardsFromPage(html, type)
     .filter((item) => item.type === type)
     .filter((item) => {
@@ -307,53 +376,20 @@ async function getCatalog(type, search = '') {
   return cards.map(toStremioMeta);
 }
 
-async function resolveCardByMetaId(type, id) {
-  const [, parsedType, , encodedChunk] = String(id).split(':');
-  if (parsedType && parsedType !== type) {
-    return null;
-  }
-
-  const expectedHash = encodedChunk || '';
-  const html = await fetchHtml(catalogUrlForType(type));
-  const cards = extractCardsFromPage(html, type);
-
-  return cards.find((card) => card.id.endsWith(expectedHash)) || null;
-}
-
 async function getMeta(type, id) {
-  const card = await resolveCardByMetaId(type, id);
-  if (!card?.sourceUrl) return null;
+  const parsed = parseMetaId(id);
+  if (!parsed || parsed.type !== type) return null;
 
-  const detailHtml = await fetchHtml(card.sourceUrl);
-  const $ = load(detailHtml);
-  const jsonLd = getJsonLd($);
-  const preferredLd = jsonLd.find((x) => x.name && (x.description || x.aggregateRating));
-
-  const year =
-    parseYearFromText(preferredLd?.datePublished) ||
-    parseYearFromText(textOrNull($, '.year')) ||
-    card.year ||
-    null;
-
-  return {
-    ...toStremioMeta(card),
-    description:
-      preferredLd?.description ||
-      textOrNull($, '.summary') ||
-      textOrNull($, '.description') ||
-      card.description ||
-      'Açıklama bulunamadı.',
-    releaseInfo: year ? String(year) : card.releaseInfo,
-    poster: pickImage(preferredLd) || card.poster,
-    background: pickImage(preferredLd) || card.background,
-  };
+  const detailHtml = await fetchHtml(parsed.sourceUrl);
+  const card = parseMetaFromDetailHtml(type, parsed.sourceUrl, detailHtml);
+  return toStremioMeta(card);
 }
 
 async function getStreams(type, id) {
-  const card = await resolveCardByMetaId(type, id);
-  if (!card?.sourceUrl) return [];
+  const parsed = parseMetaId(id);
+  if (!parsed || parsed.type !== type) return [];
 
-  const detailHtml = await fetchHtml(card.sourceUrl);
+  const detailHtml = await fetchHtml(parsed.sourceUrl);
   const links = extractVideoLinks(detailHtml);
 
   return links.map((link) => ({
