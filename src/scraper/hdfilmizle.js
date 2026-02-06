@@ -150,13 +150,34 @@ function detectContentType(input = '') {
   const s = String(input).toLowerCase();
   if (s.includes('/dizi') || s.includes('episode') || s.includes('season')) return 'series';
   if (s.includes('/seri') || s.includes('tvseries')) return 'series';
-  return 'movie';
+  if (s.includes('/film') || s.includes('/movie')) return 'movie';
+  return null;
 }
 
 function catalogUrlForType(type, search = '') {
-  const base = type === 'series' ? `${BASE_URL}/dizi` : BASE_URL;
-  if (!search) return base;
-  return `${BASE_URL}/?s=${encodeURIComponent(search)}`;
+  if (search) {
+    return [`${BASE_URL}/?s=${encodeURIComponent(search)}`];
+  }
+
+  if (type === 'series') {
+    return [`${BASE_URL}/dizi`, `${BASE_URL}/diziler`];
+  }
+
+  return [BASE_URL, `${BASE_URL}/film`, `${BASE_URL}/filmler`];
+}
+
+async function fetchFirstWorkingHtml(urls) {
+  const errors = [];
+  for (const url of urls) {
+    try {
+      const html = await fetchHtml(url);
+      if (html && html.length > 0) return html;
+    } catch (error) {
+      errors.push(`${url} -> ${error.message}`);
+    }
+  }
+
+  throw new Error(`Uygun katalog kaynağı bulunamadı: ${errors.join(' | ')}`);
 }
 
 function extractCardsFromPage(html, fallbackType = 'movie') {
@@ -177,10 +198,11 @@ function extractCardsFromPage(html, fallbackType = 'movie') {
     if (!url) return;
     const title = item.name?.trim();
     if (!title) return;
-    const type =
+    const detectedType =
       item['@type'] === 'TVSeries' || item['@type'] === 'Episode'
         ? 'series'
-        : detectContentType(url) || fallbackType;
+        : detectContentType(url);
+    const type = detectedType || fallbackType;
 
     addCard({
       id: buildMetaId(type, url, title),
@@ -204,6 +226,11 @@ function extractCardsFromPage(html, fallbackType = 'movie') {
   });
 
   const cardSelectors = [
+    '.item',
+    '.items .item',
+    '.movies .item',
+    '.result-item',
+    '.search-page .result-item',
     '.movie-card',
     '.movie-item',
     '.film-item',
@@ -218,6 +245,7 @@ function extractCardsFromPage(html, fallbackType = 'movie') {
     const $el = $(element);
     const href =
       attrOrNull($, 'a', 'href', $el) ||
+      attrOrNull($, 'a', 'data-href', $el) ||
       attrOrNull($, '.title a', 'href', $el) ||
       attrOrNull($, '.poster a', 'href', $el);
 
@@ -225,10 +253,11 @@ function extractCardsFromPage(html, fallbackType = 'movie') {
     if (!sourceUrl) return;
 
     const name =
+      attrOrNull($, 'a[title]', 'title', $el) ||
       textOrNull($, '.title', $el) ||
       textOrNull($, 'h2', $el) ||
       textOrNull($, 'h3', $el) ||
-      attrOrNull($, 'a[title]', 'title', $el) ||
+      textOrNull($, '.data h3', $el) ||
       textOrNull($, 'a', $el);
 
     if (!name) return;
@@ -364,7 +393,7 @@ function toStremioMeta(card) {
 }
 
 async function getCatalog(type, search = '') {
-  const html = await fetchHtml(catalogUrlForType(type, search));
+  const html = await fetchFirstWorkingHtml(catalogUrlForType(type, search));
   const cards = extractCardsFromPage(html, type)
     .filter((item) => item.type === type)
     .filter((item) => {
